@@ -1,82 +1,90 @@
+
 import streamlit as st
 import pandas as pd
 import pickle
 import re
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-# ------------------- Helper Functions -------------------
-
+# ---------- Helper: Clean text ----------
 def clean_text(text):
     text = text.lower()
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-def calculate_medicine_score(excellent, average, poor):
-    score = (excellent * 0.06) + (average * 0.03) + (poor * 0.01)
-    return round(score, 2)
+# ---------- Load cleaned dataset ----------
+@st.cache_data
+def load_data():
+    df = pd.read_csv("cleaned_medicine_dataset.csv")
+    return df
 
-def recommend_medicines(symptom_text, vectorizer, matrix, df):
+df = load_data()
+
+# ---------- Load TF-IDF + Cosine Similarity model ----------
+@st.cache_resource
+def build_similarity_model(data):
+    vectorizer = TfidfVectorizer(stop_words='english', max_features=5000)
+    tfidf_matrix = vectorizer.fit_transform(data['Uses'].fillna("").apply(clean_text))
+    return vectorizer, tfidf_matrix
+
+vectorizer_sim, tfidf_matrix_sim = build_similarity_model(df)
+
+
+# ---------- Load Logistic Regression model ----------
+@st.cache_resource
+def load_lr_model():
+    with open("recommend_lr.pkl", "rb") as f:
+        data = pickle.load(f)
+    return data["model"], data["vectorizer"]
+
+lr_model, tfidf_vectorizer = load_lr_model()
+
+
+# ---------- TF-IDF Similarity Function ----------
+def recommend(symptom, top_n=5):
+    cleaned = clean_text(symptom)
+    vec = vectorizer_sim.transform([cleaned])
+    sims = cosine_similarity(vec, tfidf_matrix_sim).flatten()
+    top_indices = sims.argsort()[::-1][:top_n]
+    results = df.iloc[top_indices].copy()
+    results["Medicine Score"] = sims[top_indices]
+    return results
+
+# ---------- Logistic Regression Prediction ----------
+def predict_relevance_ml(symptom_text):
     cleaned = clean_text(symptom_text)
-    input_vec = vectorizer.transform([cleaned])
-    sim_scores = cosine_similarity(matrix, input_vec).flatten()
-    top_indices = sim_scores.argsort()[::-1][:10]
+    vec = tfidf_vectorizer.transform([cleaned])
+    prob = lr_model.predict_proba(vec)[0][1]
+    pred = lr_model.predict(vec)[0]
+    return pred, prob
 
-    recs = df.iloc[top_indices].copy()
-    recs["Medicine Score"] = recs.apply(
-        lambda row: calculate_medicine_score(row["Excellent"], row["Average"], row["Poor"]), axis=1
-    )
+# ---------- Streamlit App ----------
+st.title("💊 Smart Medicine Recommendation System")
 
-    recs["final_score"] = 0.7 * sim_scores[top_indices] + 0.3 * recs["Medicine Score"] / 6
-    recs = recs.sort_values("final_score", ascending=False).head(6)
-    recs["Similarity %"] = [round(sim_scores[i]*100, 1) for i in recs.index]
-    return recs
+# Sidebar for mode selection
+st.sidebar.title("Recommendation Mode")
+mode = st.sidebar.radio(
+    "Select method:",
+    ("TF-IDF Similarity", "Logistic Regression (ML)")
+)
 
-# ------------------- Load Model -------------------
+# Main Input
+user_input = st.text_input("Enter symptom or condition:")
 
-with open("recommend.pkl", "rb") as f:
-    model = pickle.load(f)
-
-vectorizer = model["tfidf_vectorizer_uses"]
-matrix = model["tfidf_matrix_uses"]
-df = model["clean_df"]
-
-# ------------------- Streamlit UI -------------------
-
-st.set_page_config(page_title="Medicine Recommender", layout="wide")
-
-st.markdown("""
-    <h1 style='text-align: center;'>💊 AI Medicine Recommendation System</h1>
-    <div style="background-color:#fffbe6;
-                padding:10px;
-                border:1px solid #ffec99;
-                border-radius:6px;
-                color:#333;">
-    🛑 <strong>Disclaimer:</strong> This tool suggests over-the-counter (OTC) medicines based on textual similarity.
-    It is <u>not</u> a substitute for professional medical advice. Always consult a doctor.
-    </div>
-""", unsafe_allow_html=True)
-
-st.write("")
-
-user_input = st.text_area("📝 Describe your symptoms (in a sentence or two):", height=100)
-
-if st.button("🔍 Recommend Medicines"):
-
-    if not user_input.strip():
-        st.warning("Please enter some symptoms first.")
-        st.stop()
-
-    results = recommend_medicines(user_input, vectorizer, matrix, df)
-
-    st.success("Top medicine suggestions:")
-    for _, row in results.iterrows():
-        with st.expander(f"{row['Name']} (Score: {row['Medicine Score']}, Match: {row['Similarity %']}%)"):
-            st.write(f"**Manufacturer**: {row.get('manufacturer', 'N/A')}")
-            st.write(f"**Uses**: {row['Uses']}")
-            st.write(f"**Side Effects**: {row.get('Side_effects', 'N/A')}")
-            st.write(f"**How to Use**: {row.get('How_to_use', 'N/A')}")
-            st.markdown(f"[📦 Product Page]({row.get('Links-href', '#')})")
-
-# Optional: footer
-st.markdown("<hr><center><small>Developed for Final Year Project — University of Greenwich</small></center>", unsafe_allow_html=True)
+if st.button("Recommend") and user_input.strip() != "":
+    if mode == "TF-IDF Similarity":
+        st.subheader("Top Recommendations (TF-IDF Similarity)")
+        recs = recommend(user_input)
+        for i, row in recs.iterrows():
+            with st.expander(f"{row['Name']} — Score {row['Medicine Score']:.2f}"):
+                st.write(f"**Manufacturer:** {row.get('manufacturer', 'N/A')}")
+                st.write(f"**Uses:** {row.get('Uses', 'N/A')}")
+                st.write(f"**Composition:** {row.get('Composition', 'N/A')}")
+    else:
+        st.subheader("ML Model Prediction")
+        pred, prob = predict_relevance_ml(user_input)
+        if pred == 1:
+            st.success(f"✅ This symptom is **likely relevant** to one or more medicines. (Confidence: {prob:.2f})")
+        else:
+            st.warning(f"⚠️ This symptom is **unlikely relevant** based on ML prediction. (Confidence: {prob:.2f})")
